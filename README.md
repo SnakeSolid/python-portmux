@@ -126,8 +126,8 @@ portmux client \
 ```
 
 **3. Use the tunnel** — any client connecting to `127.0.0.1:12345` is now
-forwarded, over the single encrypted-control-style (token-authenticated) control
-connection, to `example.com:443`.
+forwarded, over the single token-authenticated control connection, to
+`example.com:443`.
 
 ## How it works
 
