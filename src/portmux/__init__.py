@@ -1,1228 +1,1199 @@
 #!/usr/bin/env python3
-"""Single-file TCP port forwarding tunnel over a custom binary protocol.
+"""
+tunnel.py - a TCP port forwarding tunnel with a custom binary multiplexing
+protocol over a single TCP control connection.
 
-This tool is similar to SSH local/remote port forwarding. Two instances of the
-script run on the two endpoints:
+Works in two modes:
 
-  * server – listens for the control connection on ``--listen``;
-  * client – connects to the server on ``--connect`` and forwards local ports.
+    * ``client`` - connects to the peer, may use ``--reconnect`` /
+      ``--keep-streams``.
+    * ``server`` - listens for the control connection.
 
-After the initial handshake both endpoints behave symmetrically. Every local TCP
-connection accepted on a forwarded bind port becomes a *stream* multiplexed over
-the single control connection; the peer turns it into a TCP connection to the
-target host:port given in the OPEN request.
+After the HELLO handshake both sides are completely symmetric: each side may
+have local listeners (``--forward``) whose accepted connections become logical
+streams carried over the control connection.
 
-The wire protocol is entirely binary. Only the Python standard library is used.
-Only IPv4 addresses and bare hostnames are supported (no IPv6 anywhere).
-
-Frame format (fixed 10-byte header + variable payload):
-
-    type(1) flags(1) stream_id(4 BE) length(4 BE) payload[length]
-
-Control frames (stream_id == 0):
-    0x01 HELLO       version(2 BE) token_len(2 BE) token(UTF-8)
-    0x02 HELLO_OK    (empty)
-    0x03 HELLO_ERR   reason(1): 1 version / 2 token / 3 other
-    0x30 PING
-    0x31 PONG
-
-Stream frames (stream_id != 0):
-    0x10 OPEN          host_len(2 BE) host(UTF-8) port(2 BE)
-    0x11 OPEN_OK       (empty)
-    0x12 OPEN_ERR      reason(1): 1 refused / 2 timeout / 3 dns / 4 forbidden / 5 other
-    0x20 DATA          arbitrary bytes
-    0x21 WINDOW_UPDATE credit(4 BE)
-    0x22 FIN           (empty)
-    0x23 CLOSE         (empty)
+Only the Python standard library is used.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import errno
+import collections
+import functools
+import hmac
 import logging
-import signal
 import socket
 import struct
 import sys
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-log = logging.getLogger("tunnel")
+LOG = logging.getLogger("tunnel")
 
 # ---------------------------------------------------------------------------
-# Protocol constants
+# Constants
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION = 1
-HELLO_TIMEOUT = 10.0
 
-# Frame types
-HELLO = 0x01
-HELLO_OK = 0x02
-HELLO_ERR = 0x03
-OPEN = 0x10
-OPEN_OK = 0x11
-OPEN_ERR = 0x12
-DATA = 0x20
-WINDOW_UPDATE = 0x21
-FIN = 0x22
-CLOSE = 0x23
-PING = 0x30
-PONG = 0x31
+HANDSHAKE_TIMEOUT = 10.0     # seconds to wait for HELLO / HELLO_OK
+CONNECT_TIMEOUT = 30.0       # seconds to wait for the target TCP connection
+OPEN_TIMEOUT = 30.0          # seconds to wait for OPEN_OK / OPEN_ERR
+CREDIT_FLUSH_INTERVAL = 0.05  # 50 ms window-update aggregation timer
 
-# OPEN_ERR reasons
-RC_REFUSED = 0x01
-RC_TIMEOUT = 0x02
-RC_DNS = 0x03
-RC_FORBIDDEN = 0x04
-RC_OTHER = 0x05
+# --- frame types -----------------------------------------------------------
+F_HELLO = 0x01
+F_HELLO_OK = 0x02
+F_HELLO_ERR = 0x03
 
-# HELLO_ERR reasons
-HF_VERSION = 0x01
-HF_TOKEN = 0x02
-HF_OTHER = 0x03
+F_OPEN = 0x10
+F_OPEN_OK = 0x11
+F_OPEN_ERR = 0x12
+F_DATA = 0x20
+F_WINDOW_UPDATE = 0x21
+F_FIN = 0x22
+F_CLOSE = 0x23
 
-_STREAM_CTRL = {OPEN_OK, OPEN_ERR, WINDOW_UPDATE, FIN, CLOSE}
+F_PING = 0x30
+F_PONG = 0x31
 
-HEADER_STRUCT = struct.Struct("!BBII")
-HEADER_LEN = HEADER_STRUCT.size  # 10
-READ_CHUNK = 65536
+CONTROL_FRAME_TYPES = frozenset({F_HELLO, F_HELLO_OK, F_HELLO_ERR, F_PING, F_PONG})
+STREAM_FRAME_TYPES = frozenset(
+    {F_OPEN, F_OPEN_OK, F_OPEN_ERR, F_DATA, F_WINDOW_UPDATE, F_FIN, F_CLOSE}
+)
 
+# --- HELLO_ERR reasons -----------------------------------------------------
+HELLO_ERR_VERSION = 0x01
+HELLO_ERR_TOKEN = 0x02
+HELLO_ERR_OTHER = 0x03
+
+# --- OPEN_ERR reasons ------------------------------------------------------
+OPEN_ERR_REFUSED = 0x01
+OPEN_ERR_TIMEOUT = 0x02
+OPEN_ERR_DNS = 0x03
+OPEN_ERR_FORBIDDEN = 0x04
+OPEN_ERR_OTHER = 0x05
+
+# type(1) flags(1) stream_id(4) length(4)
+HEADER = struct.Struct("!BBII")
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
 
 class ProtocolError(Exception):
-    """A protocol / frame-format violation. Closes the control connection."""
+    """Any protocol violation: the control connection is closed immediately."""
+
+
+class HandshakeError(Exception):
+    """The HELLO exchange failed."""
+
+
+class OpenFailure(Exception):
+    """Internal helper carrying an OPEN_ERR reason code."""
+
+    def __init__(self, reason: int) -> None:
+        super().__init__(f"open failure (reason {reason})")
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
-# Address helpers
+# Frames
 # ---------------------------------------------------------------------------
-
-
-def host_ok(host: str) -> bool:
-    """Return True if *host* is an IPv4 address or a bare hostname (no IPv6)."""
-    host = host.strip()
-    if not host:
-        return False
-    if ":" in host:              # IPv6 literal or bracketed address
-        return False
-    if "[" in host or "]" in host:
-        return False
-    if "/" in host or any(ch.isspace() for ch in host):
-        return False
-    return True
-
-
-def _port(text: str, what: str) -> int:
-    try:
-        p = int(text)
-    except ValueError:
-        raise ValueError(f"{what}: invalid port {text!r}")
-    if not (0 <= p <= 65535):
-        raise ValueError(f"{what}: port {p} out of range")
-    return p
-
-
-def parse_host_port(text: str, what: str) -> tuple[str, int]:
-    parts = text.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"{what}: expected HOST:PORT, got {text!r}")
-    host, port_s = parts
-    if not host_ok(host):
-        raise ValueError(f"{what}: invalid host {host!r} (IPv6 not supported)")
-    return host, _port(port_s, what)
-
-
-def parse_forward(text: str) -> tuple[tuple[str, int], tuple[str, int]]:
-    parts = text.split(":")
-    if len(parts) != 4:
-        raise ValueError(
-            f"--forward: expected BIND_HOST:BIND_PORT:TARGET_HOST:TARGET_PORT, got {text!r}"
-        )
-    bh, bp, th, tp = parts
-    if not host_ok(bh):
-        raise ValueError(f"--forward: invalid bind host {bh!r}")
-    if not host_ok(th):
-        raise ValueError(f"--forward: invalid target host {th!r}")
-    return (bh, _port(bp, "--forward")), (th, _port(tp, "--forward"))
-
-
-# ---------------------------------------------------------------------------
-# Framing
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class Frame:
+    """A single protocol frame."""
+
     type: int
-    flags: int
-    stream_id: int
-    payload: bytes
-
-    def to_bytes(self) -> bytes:
-        return HEADER_STRUCT.pack(self.type, self.flags, self.stream_id,
-                                  len(self.payload)) + self.payload
+    stream_id: int = 0
+    payload: bytes = b""
+    flags: int = 0
 
 
-class FrameDecoder:
-    """Incremental decoder producing complete frames from a byte stream.
+def encode_frame(frame: Frame) -> bytes:
+    """Serialize a frame to bytes (header + payload)."""
+    payload = frame.payload or b""
+    return HEADER.pack(frame.type, frame.flags, frame.stream_id, len(payload)) + payload
 
-    If a header announces a length larger than ``max_frame_size`` a
-    ProtocolError is raised (immediate control connection closure).
-    """
 
-    def __init__(self, max_frame_size: int):
-        self._max = max_frame_size
-        self._buf = bytearray()
-        self._want = HEADER_LEN
+async def read_frame(reader: asyncio.StreamReader, max_frame_size: int) -> Frame:
+    """Read and decode exactly one frame from *reader*."""
+    header = await reader.readexactly(HEADER.size)
+    ftype, flags, stream_id, length = HEADER.unpack(header)
+    if length > max_frame_size:
+        raise ProtocolError(
+            f"frame payload too large: {length} > {max_frame_size}"
+        )
+    payload = await reader.readexactly(length) if length else b""
+    return Frame(type=ftype, stream_id=stream_id, payload=payload, flags=flags)
 
-    def feed(self, data: bytes) -> list[Frame]:
-        self._buf.extend(data)
-        frames: list[Frame] = []
-        while True:
-            if self._want == HEADER_LEN:
-                if len(self._buf) < HEADER_LEN:
-                    break
-                _, _, _, flen = HEADER_STRUCT.unpack_from(self._buf, 0)
-                if flen > self._max:
-                    raise ProtocolError(
-                        f"frame length {flen} exceeds max frame size {self._max}"
-                    )
-                self._want = HEADER_LEN + flen
-            if len(self._buf) < self._want:
-                break
-            ftype, fflags, fstream, flen = HEADER_STRUCT.unpack_from(self._buf, 0)
-            payload = bytes(self._buf[HEADER_LEN:self._want])
-            frames.append(Frame(ftype, fflags, fstream, payload))
-            del self._buf[:self._want]
-            self._want = HEADER_LEN
-        return frames
+
+def encode_open(host: str, port: int) -> bytes:
+    """Build an OPEN payload: host_len(2) host port(2)."""
+    host_bytes = host.encode("utf-8")
+    return struct.pack("!H", len(host_bytes)) + host_bytes + struct.pack("!H", port)
+
+
+def decode_open(payload: bytes) -> Tuple[str, int]:
+    """Parse an OPEN payload."""
+    if len(payload) < 4:
+        raise ProtocolError("malformed OPEN payload")
+    host_len = struct.unpack_from("!H", payload, 0)[0]
+    if len(payload) != 2 + host_len + 2:
+        raise ProtocolError("malformed OPEN payload")
+    try:
+        host = payload[2:2 + host_len].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("OPEN host is not valid UTF-8") from exc
+    port = struct.unpack_from("!H", payload, 2 + host_len)[0]
+    return host, port
 
 
 # ---------------------------------------------------------------------------
-# Allow policy
+# Small helpers
 # ---------------------------------------------------------------------------
+
+def parse_host_port(spec: str) -> Tuple[str, int]:
+    """Parse ``HOST:PORT`` (IPv4 or hostname only, no brackets)."""
+    if spec.count(":") != 1:
+        raise ValueError(f"invalid HOST:PORT value: {spec!r}")
+    host, port_str = spec.split(":")
+    if not host:
+        raise ValueError(f"empty host in {spec!r}")
+    return host, int(port_str)
+
+
+def parse_forward(spec: str) -> Tuple[str, int, str, int]:
+    """Parse ``BIND_HOST:BIND_PORT:TARGET_HOST:TARGET_PORT``."""
+    parts = spec.split(":")
+    if len(parts) != 4:
+        raise ValueError(
+            f"invalid --forward value {spec!r}: expected "
+            "BIND_HOST:BIND_PORT:TARGET_HOST:TARGET_PORT"
+        )
+    bind_host, bind_port, target_host, target_port = parts
+    if not bind_host or not target_host:
+        raise ValueError(f"invalid --forward value {spec!r}")
+    return bind_host, int(bind_port), target_host, int(target_port)
 
 
 class AllowPolicy:
-    def __init__(self, allow_all: bool, allow_list: list[tuple[str, int]]):
-        self.allow_all = allow_all
-        self.allow_list = list(allow_list)
+    """Decides whether an OPEN request may be served."""
 
-    def allowed(self, host: str, port: int) -> bool:
+    def __init__(self, allowed: Optional[List[str]], allow_all: bool) -> None:
+        self.allow_all = allow_all
+        self._allowed = set()
+        for spec in allowed or []:
+            host, port = parse_host_port(spec)
+            self._allowed.add((host.lower(), port))
+
+    def check(self, host: str, port: int) -> bool:
         if self.allow_all:
             return True
-        return (host, port) in self.allow_list
+        return (host.lower(), port) in self._allowed
+
+
+class PriorityWriter:
+    """Two-queue (high / normal) writer used for the control connection."""
+
+    def __init__(self) -> None:
+        self._high: collections.deque = collections.deque()
+        self._low: collections.deque = collections.deque()
+        self._event = asyncio.Event()
+
+    def push(self, frame: Frame, high: bool = False) -> None:
+        if high:
+            self._high.append(frame)
+        else:
+            self._low.append(frame)
+        self._event.set()
+
+    async def get(self) -> Frame:
+        while True:
+            if self._high:
+                return self._high.popleft()
+            if self._low:
+                return self._low.popleft()
+            self._event.clear()
+            await self._event.wait()
+
+
+async def connect_target(host: str, port: int):
+    """Open a TCP connection to the target, IPv4 only."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.open_connection(host, port, family=socket.AF_INET),
+            timeout=CONNECT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise OpenFailure(OPEN_ERR_TIMEOUT)
+    except socket.gaierror:
+        raise OpenFailure(OPEN_ERR_DNS)
+    except ConnectionRefusedError:
+        raise OpenFailure(OPEN_ERR_REFUSED)
+    except OSError:
+        raise OpenFailure(OPEN_ERR_OTHER)
 
 
 # ---------------------------------------------------------------------------
 # Stream
 # ---------------------------------------------------------------------------
 
-
-@dataclass
 class Stream:
-    """State for a single logical stream within one control connection.
+    """One logical stream = one local TCP socket on each side."""
 
-    ``reader``/``writer`` are the *local* socket endpoints (the accepted local
-    connection on the initiator, or the dialed target connection on the peer).
-    """
+    def __init__(
+        self,
+        stream_id: int,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        args: argparse.Namespace,
+        initiator: bool,
+        streams: Dict[int, "Stream"],
+        target: Optional[Tuple[str, int]] = None,
+    ) -> None:
+        self.id = stream_id
+        self.reader = reader
+        self.writer = writer
+        self.window = args.window_size
+        self.max_frame_size = args.max_frame_size
+        self.initiator = initiator
+        self.target = target
+        self.streams = streams
 
-    stream_id: int
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-    window_size: int
-    send_credit: int          # remaining outbound credit (bytes left before pause)
-    peer_is_initiator: bool = False
+        self.tunnel: Optional["Tunnel"] = None
+        self.closed = False
+        self.fin_sent = False
+        self.fin_received = False
+        self.send_done = False
+        self.recv_done = False
 
-    pending_ack: int = 0      # inbound bytes since last WINDOW_UPDATE
-    fin_sent: bool = False
-    fin_received: bool = False
-    closed: bool = False
+        self.send_credit = args.window_size
+        self.pending_credit = 0
+        self.credit_event = asyncio.Event()
+        self.ready_event = asyncio.Event()
+        self.open_result = asyncio.Event()
+        self.open_error: Optional[int] = None
 
-    data_q: asyncio.Queue = field(default_factory=asyncio.Queue)
-    credit_event: asyncio.Event = field(default_factory=asyncio.Event)
+        self.incoming: asyncio.Queue = asyncio.Queue()
 
-    send_task: asyncio.Task|None = None
-    recv_task: asyncio.Task|None = None
+        self._open_task: Optional[asyncio.Task] = None
+        self._send_task: Optional[asyncio.Task] = None
+        self._recv_task: Optional[asyncio.Task] = None
 
-    # Target for the OPEN (used by --keep-streams to re-OPEN after a reconnect).
-    target: tuple[str, int]|None = None
+    # -- lifecycle ----------------------------------------------------------
 
-    def __post_init__(self):
+    def start(self) -> None:
+        """Start the stream tasks."""
+        if self.initiator:
+            self._open_task = asyncio.ensure_future(self._open_handshake())
+        else:
+            self.ready_event.set()
+        self._send_task = asyncio.ensure_future(self._local_to_remote())
+        self._recv_task = asyncio.ensure_future(self._remote_to_local())
+
+    def attach(self, tunnel: "Tunnel") -> None:
+        """Bind the stream to a (new) control connection."""
+        self.tunnel = tunnel
+        self.send_credit = self.window
         self.credit_event.set()
 
+    def detach(self) -> None:
+        """Control connection lost; keep the stream alive for a reconnect."""
+        self.tunnel = None
+        self.ready_event.clear()
+        self.send_credit = self.window
+        self.pending_credit = 0
+        self.credit_event.set()
+        if self._open_task is not None and not self._open_task.done():
+            self._open_task.cancel()
+        self._open_task = None
+
+    def reopen(self, tunnel: "Tunnel") -> None:
+        """Re-send OPEN for this stream on a freshly established tunnel."""
+        if self.closed:
+            return
+        self.attach(tunnel)
+        self.ready_event.clear()
+        self.open_result.clear()
+        self.open_error = None
+        if self._open_task is not None and not self._open_task.done():
+            self._open_task.cancel()
+        self._open_task = asyncio.ensure_future(self._open_handshake())
+
+    # -- outgoing -----------------------------------------------------------
+
+    async def _open_handshake(self) -> None:
+        """Send OPEN and wait for the peer's verdict."""
+        tunnel = self.tunnel
+        if tunnel is None or self.target is None:
+            return
+        tunnel.send_frame(
+            Frame(F_OPEN, self.id, encode_open(self.target[0], self.target[1])),
+            high=True,
+        )
+        try:
+            await asyncio.wait_for(self.open_result.wait(), OPEN_TIMEOUT)
+        except asyncio.TimeoutError:
+            LOG.warning("stream %d: OPEN timed out", self.id)
+            self.close("open timeout", send_close=True)
+            return
+        except asyncio.CancelledError:
+            raise
+
+        if self.open_error is not None:
+            LOG.info("stream %d: OPEN rejected (reason %d)", self.id, self.open_error)
+            self.close("open rejected")
+            return
+
+        self.ready_event.set()
+        # If the local side already hit EOF while we were (re)opening,
+        # the peer still has to learn about it.
+        if self.fin_sent and self.tunnel is not None:
+            self.tunnel.send_frame(Frame(F_FIN, self.id), high=True)
+
+    async def _local_to_remote(self) -> None:
+        """Read from the local socket and ship DATA over the tunnel."""
+        try:
+            while not self.closed:
+                data = await self.reader.read(self.max_frame_size)
+                if not data:
+                    break
+                await self._send_data(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # connection reset, ...
+            LOG.debug("stream %d: local read error: %s", self.id, exc)
+            self.send_done = True
+            self.close("local read error", send_close=True)
+            return
+
+        self.send_done = True
+        self._send_fin()
+        self.maybe_finish()
+
+    async def _send_data(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view and not self.closed:
+            await self.ready_event.wait()
+            if self.closed:
+                return
+            await self._wait_credit()
+            if self.closed:
+                return
+            chunk_len = min(len(view), self.send_credit, self.max_frame_size)
+            if chunk_len <= 0:
+                continue
+            chunk = bytes(view[:chunk_len])
+            view = view[chunk_len:]
+            self.send_credit -= chunk_len
+            if self.send_credit <= 0:
+                self.credit_event.clear()
+            tunnel = self.tunnel
+            if tunnel is None:
+                return
+            tunnel.send_frame(Frame(F_DATA, self.id, chunk), high=False)
+
+    async def _wait_credit(self) -> None:
+        while self.send_credit <= 0 and not self.closed:
+            self.credit_event.clear()
+            await self.credit_event.wait()
+
+    def _send_fin(self) -> None:
+        if self.fin_sent or self.closed:
+            return
+        self.fin_sent = True
+        if self.tunnel is not None:
+            self.tunnel.send_frame(Frame(F_FIN, self.id), high=True)
+
+    # -- incoming -----------------------------------------------------------
+
+    async def _remote_to_local(self) -> None:
+        """Write DATA coming from the peer into the local socket."""
+        try:
+            while True:
+                if self.closed:
+                    return
+                if self.pending_credit:
+                    try:
+                        data = await asyncio.wait_for(
+                            self.incoming.get(), CREDIT_FLUSH_INTERVAL
+                        )
+                    except asyncio.TimeoutError:
+                        self._flush_credit()
+                        continue
+                else:
+                    data = await self.incoming.get()
+
+                if data is None:
+                    break
+
+                self.writer.write(data)
+                await self.writer.drain()
+                self.pending_credit += len(data)
+                if self.pending_credit >= max(1, self.window // 2):
+                    self._flush_credit()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.debug("stream %d: local write error: %s", self.id, exc)
+            self.recv_done = True
+            self.close("local write error", send_close=True)
+            return
+
+        # The peer half-closed: propagate the EOF to the local socket.
+        try:
+            if self.writer.can_write_eof():
+                self.writer.write_eof()
+        except Exception:
+            pass
+        if not self.fin_received:
+            self._flush_credit()
+        self.recv_done = True
+        self.maybe_finish()
+
+    def _flush_credit(self) -> None:
+        if self.pending_credit <= 0 or self.closed:
+            return
+        tunnel = self.tunnel
+        if tunnel is None:
+            return
+        amount = self.pending_credit
+        self.pending_credit = 0
+        tunnel.send_frame(
+            Frame(F_WINDOW_UPDATE, self.id, struct.pack("!I", amount)), high=True
+        )
+
+    # -- callbacks from the tunnel -----------------------------------------
+
+    def on_open_ok(self) -> None:
+        self.open_error = None
+        self.open_result.set()
+
+    def on_open_err(self, reason: int) -> None:
+        self.open_error = reason
+        self.open_result.set()
+
+    def on_data(self, payload: bytes) -> None:
+        if self.closed:
+            return
+        self.incoming.put_nowait(payload)
+
+    def on_window_update(self, credit: int) -> None:
+        if self.closed:
+            return
+        self.send_credit += credit
+        if self.send_credit > 0:
+            self.credit_event.set()
+
+    def on_fin(self) -> None:
+        if self.fin_received or self.closed:
+            return
+        self.fin_received = True
+        # Sentinel: all previously queued DATA is written before the EOF.
+        self.incoming.put_nowait(None)
+
+    # -- closing ------------------------------------------------------------
+
+    def maybe_finish(self) -> None:
+        if self.closed:
+            return
+        if self.fin_sent and self.fin_received and self.send_done and self.recv_done:
+            LOG.debug("stream %d: closed cleanly", self.id)
+            self._teardown()
+
+    def close(self, reason: str = "", send_close: bool = False) -> None:
+        if self.closed:
+            return
+        LOG.debug("stream %d: closing (%s)", self.id, reason or "no reason")
+        if send_close and self.tunnel is not None:
+            self.tunnel.send_frame(Frame(F_CLOSE, self.id), high=True)
+        self._teardown()
+
+    def _teardown(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.ready_event.set()
+        self.credit_event.set()
+
+        current = asyncio.current_task()
+        for task in (self._open_task, self._send_task, self._recv_task):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+
+        try:
+            self.writer.close()
+        except Exception:
+            pass
+
+        self.streams.pop(self.id, None)
+
 
 # ---------------------------------------------------------------------------
-# Config bundle
+# Tunnel (control connection)
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Config:
-    token: str
-    forwards: list
-    window_size: int
-    max_frame_size: int
-    keepalive: float
-
-
-# ---------------------------------------------------------------------------
-# Tunnel: one control connection
-# ---------------------------------------------------------------------------
-
 
 class Tunnel:
-    """Manages one control connection, its stream table and its two write queues.
+    """Owns the control connection and the stream table."""
 
-    A single reader loop consumes every frame. DATA frames are routed to the
-    owning stream's ``data_q``; a per-stream receive task drains that queue and
-    writes to the local socket. Per-stream send tasks read from the local socket
-    and produce DATA frames.
-
-    Outbound frames go to one of two queues: *high* for control frames and
-    *normal* for DATA, so control frames always overtake bulk data.
-    """
-
-    def __init__(self, reader, writer, *, is_client, cfg: Config, allow_policy):
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        is_client: bool,
+        args: argparse.Namespace,
+        streams: Optional[Dict[int, Stream]] = None,
+        allow: Optional[AllowPolicy] = None,
+        next_id: Optional[int] = None,
+    ) -> None:
         self.reader = reader
         self.writer = writer
         self.is_client = is_client
-        self.cfg = cfg
-        self.allow_policy = allow_policy
+        self.args = args
+        self.streams: Dict[int, Stream] = streams if streams is not None else {}
+        self.allow = allow or AllowPolicy(args.allow, args.allow_all)
+        self.max_frame_size = args.max_frame_size
 
-        # Client uses odd stream ids, server even ids.
-        self.next_stream_id = 1 if is_client else 2
+        self.next_id = next_id if next_id is not None else (1 if is_client else 2)
+        self.pw = PriorityWriter()
+        self.last_pong = time.monotonic()
 
-        self.streams: dict[int, Stream] = {}
-        self.decoder = FrameDecoder(cfg.max_frame_size)
+        self._closed = asyncio.Event()
+        self._stopped = False
+        self._tasks: List[asyncio.Task] = []
 
-        self.high_queue: asyncio.Queue[Frame] = asyncio.Queue()
-        self.normal_queue: asyncio.Queue[Frame] = asyncio.Queue()
+    # -- id allocation ------------------------------------------------------
 
-        self.connected = False
-        self._pong_event: asyncio.Event|None = None
-        self._tasks: list[asyncio.Task] = []
-        self._close_tasks: list[asyncio.Task] = []
-        self._writer_task: asyncio.Task|None = None
-        self._torn = False
+    def alloc_id(self) -> int:
+        stream_id = self.next_id
+        self.next_id = (self.next_id + 2) & 0xFFFFFFFF
+        if self.next_id == 0:
+            self.next_id = 1 if self.is_client else 2
+        return stream_id
 
-    # -- outbound -----------------------------------------------------------
+    # -- sending ------------------------------------------------------------
 
-    def send_control(self, f: Frame) -> None:
-        if self.connected:
-            self.high_queue.put_nowait(f)
-
-    def send_data(self, f: Frame) -> None:
-        if self.connected:
-            self.normal_queue.put_nowait(f)
-
-    def send_ordered(self, f: Frame) -> None:
-        """Send a control frame that must follow that stream's DATA.
-
-        FIN (half-close) shares a direction with DATA and must not overtake the
-        stream's own queued DATA, otherwise the peer would treat the FIN as a
-        boundary and drop the trailing payload. Out-of-band control frames
-        (WINDOW_UPDATE, PING, OPEN_OK, ...) still use send_control() so they
-        keep priority over other streams' data.
-        """
-        if self.connected:
-            self.normal_queue.put_nowait(f)
-
-    # -- handshake ----------------------------------------------------------
-
-    async def _read_exact(self, n: int) -> bytes:
-        return await self.reader.readexactly(n)
-
-    async def client_handshake(self) -> bool:
-        """Client side: send HELLO, wait for HELLO_OK / HELLO_ERR."""
-        t = self.cfg.token.encode("utf-8")
-        payload = struct.pack("!HH", PROTOCOL_VERSION, len(t)) + t
-        try:
-            self.writer.write(encode_frame(Frame(HELLO, 0, 0, payload)))
-            await self.writer.drain()
-            header = await self._read_exact(HEADER_LEN)
-            ftype, _flags, fstream, flen = HEADER_STRUCT.unpack(header)
-            if fstream != 0 or flen > self.cfg.max_frame_size:
-                raise ProtocolError("bad handshake reply header")
-            body = await self._read_exact(flen)
-            if ftype == HELLO_OK:
-                log.info("handshake OK")
-                return True
-            if ftype == HELLO_ERR:
-                reason = body[0] if body else HF_OTHER
-                log.info("server rejected handshake (reason 0x%02x)", reason)
-                return False
-            raise ProtocolError("unexpected reply to HELLO")
-        except (asyncio.IncompleteReadError, EOFError, ConnectionError, OSError) as exc:
-            log.error("handshake I/O error: %s", exc)
+    def send_frame(self, frame: Frame, high: bool = False) -> bool:
+        if self._stopped:
             return False
-
-    async def server_handshake(self) -> bool:
-        """Server side: wait for and validate the client's HELLO."""
-        log.info("waiting for HELLO from client")
-        try:
-            header = await asyncio.wait_for(self._read_exact(HEADER_LEN), HELLO_TIMEOUT)
-        except (TimeoutError, asyncio.IncompleteReadError, EOFError,
-                ConnectionError, OSError):
-            log.info("handshake failed (no HELLO within timeout)")
-            return False
-        ftype, _flags, fstream, flen = HEADER_STRUCT.unpack(header)
-        if fstream != 0 or flen > self.cfg.max_frame_size or ftype != HELLO:
-            self._send_hello_err(HF_OTHER)
-            return False
-        try:
-            body = await self._read_exact(flen)
-        except (asyncio.IncompleteReadError, EOFError, ConnectionError):
-            return False
-        if len(body) < 4:
-            self._send_hello_err(HF_OTHER)
-            return False
-        version = struct.unpack_from("!H", body, 0)[0]
-        token_len = struct.unpack_from("!H", body, 2)[0]
-        if 4 + token_len > len(body):
-            self._send_hello_err(HF_OTHER)
-            return False
-        token = body[4:4 + token_len].decode("utf-8", "replace")
-        if version != PROTOCOL_VERSION:
-            log.info("handshake rejected: incompatible version %d", version)
-            self._send_hello_err(HF_VERSION)
-            return False
-        if token != self.cfg.token:
-            log.info("handshake rejected: invalid token")
-            self._send_hello_err(HF_TOKEN)
-            return False
-        # The connection is not yet "established", so write HELLO_OK directly
-        # rather than via the (not-yet-running) writer pump's control queue.
-        try:
-            self.writer.write(encode_frame(Frame(HELLO_OK, 0, 0, b"")))
-            await self.writer.drain()
-        except (ConnectionError, OSError):
-            return False
-        log.info("handshake OK")
+        self.pw.push(frame, high=high)
         return True
 
-    def _send_hello_err(self, reason: int) -> None:
+    def remove_stream(self, stream_id: int) -> None:
+        self.streams.pop(stream_id, None)
+
+    # -- main loop ----------------------------------------------------------
+
+    async def run(self) -> None:
+        """Serve the control connection until it dies."""
+        self._tasks = [
+            asyncio.ensure_future(self._writer_loop()),
+            asyncio.ensure_future(self._reader_loop()),
+            asyncio.ensure_future(self._keepalive_loop()),
+        ]
         try:
-            self.writer.write(encode_frame(Frame(HELLO_ERR, 0, 0, bytes([reason]))))
-        except (ConnectionError, OSError):
-            pass
+            await self._closed.wait()
+        finally:
+            self._stopped = True
+            for task in self._tasks:
+                task.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            try:
+                self.writer.close()
+            except Exception:
+                pass
 
-    # -- main read loop -----------------------------------------------------
+    def _fail(self) -> None:
+        self._closed.set()
 
-    async def read_frames_until_eof(self) -> None:
-        """Consume frames from the reader until EOF or a protocol error."""
+    async def _writer_loop(self) -> None:
         try:
             while True:
-                chunk = await self.reader.read(READ_CHUNK)
-                if not chunk:
-                    break
-                for f in self.decoder.feed(chunk):
-                    await self._handle_frame(f)
-        except (asyncio.IncompleteReadError, EOFError, ConnectionError, OSError) as exc:
-            log.debug("read loop ended: %s", exc)
-        except ProtocolError as exc:
-            log.error("protocol error: %s", exc)
-        finally:
-            self.connected = False
+                frame = await self.pw.get()
+                self.writer.write(encode_frame(frame))
+                await self.writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.info("control writer stopped: %s", exc)
+            self._fail()
 
-    def run_context(self) -> None:
-        """Start the writer pump and keepalive for an established connection."""
-        self.connected = True
-        self._writer_task = asyncio.create_task(self._writer_pump())
-        if self.cfg.keepalive and self.cfg.keepalive > 0:
-            self._tasks.append(asyncio.create_task(self._keepalive_loop()))
+    async def _reader_loop(self) -> None:
+        try:
+            while True:
+                frame = await read_frame(self.reader, self.max_frame_size)
+                await self._handle_frame(frame)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.IncompleteReadError:
+            LOG.info("control connection closed by peer")
+        except ProtocolError as exc:
+            LOG.error("protocol error: %s", exc)
+        except Exception as exc:
+            LOG.info("control connection error: %s", exc)
+        finally:
+            self._fail()
+
+    async def _keepalive_loop(self) -> None:
+        interval = float(self.args.keepalive)
+        if interval <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if time.monotonic() - self.last_pong > 3 * interval:
+                    LOG.warning("keepalive timeout, dropping control connection")
+                    self._fail()
+                    return
+                self.send_frame(Frame(F_PING, 0), high=True)
+        except asyncio.CancelledError:
+            raise
 
     # -- frame dispatch -----------------------------------------------------
 
-    async def _handle_frame(self, f: Frame) -> None:
-        if f.stream_id == 0:
-            await self._handle_control(f)
-        else:
-            await self._handle_stream(f)
-
-    async def _handle_control(self, f: Frame) -> None:
-        ft = f.type
-        if ft == PING:
-            self.send_control(Frame(PONG, 0, 0, b""))
-        elif ft == PONG:
-            ev = self._pong_event
-            if ev is not None:
-                ev.set()
-        elif ft in (HELLO, HELLO_OK, HELLO_ERR):
-            raise ProtocolError(f"unexpected handshake frame 0x{ft:02x}")
-        else:
-            raise ProtocolError(f"unknown control frame type 0x{ft:02x}")
-
-    async def _handle_stream(self, f: Frame) -> None:
-        sid = f.stream_id
-        if f.type == OPEN:
-            if sid in self.streams:
-                raise ProtocolError(f"OPEN for already-active stream {sid}")
-            await self._on_open(f)
+    async def _handle_frame(self, frame: Frame) -> None:
+        if frame.stream_id == 0:
+            if frame.type not in CONTROL_FRAME_TYPES:
+                raise ProtocolError(f"frame 0x{frame.type:02x} on control stream")
+            self._handle_control(frame)
             return
 
-        stream = self.streams.get(sid)
+        if frame.type not in STREAM_FRAME_TYPES:
+            raise ProtocolError(f"unknown frame type 0x{frame.type:02x}")
+
+        if frame.type == F_OPEN:
+            await self._handle_open(frame)
+            return
+
+        stream = self.streams.get(frame.stream_id)
         if stream is None:
-            # DATA for an unknown stream is ignored (race during closure).
-            if f.type in (_STREAM_CTRL | {DATA}):
-                log.debug("ignoring 0x%02x for unknown stream %d", f.type, sid)
-            else:
-                raise ProtocolError(f"unknown stream frame type 0x{f.type:02x}")
+            LOG.debug(
+                "ignoring frame 0x%02x for unknown stream %d",
+                frame.type,
+                frame.stream_id,
+            )
             return
 
-        ft = f.type
-        if ft == OPEN_OK:
-            await self._on_open_ok(stream)
-        elif ft == OPEN_ERR:
-            reason = f.payload[0] if f.payload else RC_OTHER
-            await self._on_open_err(stream, reason)
-        elif ft == WINDOW_UPDATE:
-            if len(f.payload) != 4:
-                raise ProtocolError("WINDOW_UPDATE payload must be 4 bytes")
-            credit = struct.unpack("!I", f.payload)[0]
-            if credit == 0:
-                raise ProtocolError("WINDOW_UPDATE with zero credit")
-            stream.send_credit += credit
-            stream.credit_event.set()
-        elif ft == DATA:
-            stream.data_q.put_nowait(f)
-        elif ft == FIN:
-            if stream.fin_received:
-                raise ProtocolError(f"duplicate FIN on stream {sid}")
-            stream.fin_received = True
-            # Queue the FIN so the receive-relay drains all preceding DATA and
-            # then half-closes the local socket (write_eof) in the correct order.
-            stream.data_q.put_nowait(f)
-            self._try_finish(stream)
-        elif ft == CLOSE:
-            await self.close_stream(stream, "remote CLOSE")
+        if frame.type == F_OPEN_OK:
+            stream.on_open_ok()
+        elif frame.type == F_OPEN_ERR:
+            reason = frame.payload[0] if frame.payload else OPEN_ERR_OTHER
+            stream.on_open_err(reason)
+        elif frame.type == F_DATA:
+            stream.on_data(frame.payload)
+        elif frame.type == F_WINDOW_UPDATE:
+            if len(frame.payload) != 4:
+                raise ProtocolError("malformed WINDOW_UPDATE payload")
+            stream.on_window_update(struct.unpack("!I", frame.payload)[0])
+        elif frame.type == F_FIN:
+            stream.on_fin()
+        elif frame.type == F_CLOSE:
+            stream.close("peer sent CLOSE")
+
+    def _handle_control(self, frame: Frame) -> None:
+        if frame.type == F_PING:
+            self.send_frame(Frame(F_PONG, 0), high=True)
+        elif frame.type == F_PONG:
+            self.last_pong = time.monotonic()
         else:
-            raise ProtocolError(f"unknown stream frame type 0x{ft:02x}")
+            raise ProtocolError(
+                f"unexpected control frame 0x{frame.type:02x} after handshake"
+            )
 
-    # -- OPEN handling ------------------------------------------------------
+    async def _handle_open(self, frame: Frame) -> None:
+        stream_id = frame.stream_id
+        if stream_id in self.streams:
+            raise ProtocolError(f"OPEN for already active stream {stream_id}")
 
-    async def _dial(self, host, port) -> tuple:
-        try:
-            r, w = await asyncio.open_connection(host, port)
-            return None, r, w
-        except (TimeoutError):
-            return RC_TIMEOUT, None, None
-        except (socket.gaierror, UnicodeError, ValueError) as exc:
-            log.warning("DNS failure for %s:%d: %s", host, port, exc)
-            return RC_DNS, None, None
-        except OSError as exc:
-            if getattr(exc, "errno", None) in (errno.ECONNREFUSED, errno.ECONNRESET):
-                return RC_REFUSED, None, None
-            log.warning("cannot connect to %s:%d: %s", host, port, exc)
-            return RC_OTHER, None, None
+        host, port = decode_open(frame.payload)
 
-    async def _on_open(self, f: Frame) -> None:
-        payload = f.payload
-        if len(payload) < 4:
-            raise ProtocolError("OPEN payload too short")
-        host_len = struct.unpack_from("!H", payload, 0)[0]
-        if 2 + host_len + 2 > len(payload):
-            raise ProtocolError("OPEN payload truncated")
-        host = payload[2:2 + host_len].decode("utf-8", "replace")
-        port = struct.unpack_from("!H", payload, 2 + host_len)[0]
-        sid = f.stream_id
-
-        # Allow policy is checked BEFORE any connection attempt.
-        if not self.allow_policy.allowed(host, port):
-            log.info("OPEN for %s:%d forbidden by allow policy", host, port)
-            self.send_control(Frame(OPEN_ERR, 0, sid, bytes([RC_FORBIDDEN])))
+        if not self.allow.check(host, port):
+            LOG.info("OPEN %s:%d rejected by policy", host, port)
+            self.send_frame(
+                Frame(F_OPEN_ERR, stream_id, bytes([OPEN_ERR_FORBIDDEN])), high=True
+            )
             return
 
-        reason, peer_r, peer_w = await self._dial(host, port)
-        if peer_r is None:
-            self.send_control(Frame(OPEN_ERR, 0, sid, bytes([reason])))
+        try:
+            reader, writer = await connect_target(host, port)
+        except OpenFailure as exc:
+            LOG.info("OPEN %s:%d failed (reason %d)", host, port, exc.reason)
+            self.send_frame(
+                Frame(F_OPEN_ERR, stream_id, bytes([exc.reason])), high=True
+            )
             return
 
-        stream = Stream(sid, peer_r, peer_w, self.cfg.window_size,
-                        self.cfg.window_size, target=(host, port))
-        self.streams[sid] = stream
-        self.send_control(Frame(OPEN_OK, 0, sid, b""))
-        self._start_relay(stream)
-        log.info("stream %d open -> %s:%d", sid, host, port)
-
-    async def _on_open_ok(self, stream: Stream) -> None:
-        # If this is a re-OPEN of a preserved stream, swap in the preserved
-        # local sockets (which our reader/writer fields may already reference).
-        log.debug("stream %d accepted by peer", stream.stream_id)
-        self._start_relay(stream)
-
-    async def _on_open_err(self, stream: Stream, reason: int) -> None:
-        log.info("stream %d open rejected (reason 0x%02x)", stream.stream_id, reason)
-        await self.close_stream(stream, "OPEN rejected by peer")
-
-    def _start_relay(self, stream: Stream) -> None:
-        if stream.send_task is None or stream.send_task.done():
-            stream.send_task = asyncio.create_task(self._relay_to_peer(stream))
-        if stream.recv_task is None or stream.recv_task.done():
-            stream.recv_task = asyncio.create_task(self._relay_from_peer(stream))
-
-    # -- relay ----------------------------------------------------------------
-
-    async def _relay_to_peer(self, stream: Stream) -> None:
-        """Local socket -> DATA frames over the control connection."""
-        sid = stream.stream_id
-        try:
-            while not stream.closed:
-                if stream.send_credit <= 0:
-                    # No credit left: block until a WINDOW_UPDATE replenishes it.
-                    # Clear the event and re-check to avoid a missed-wakeup race
-                    # (the WINDOW_UPDATE handler sets the event after adding
-                    # credit).
-                    stream.credit_event.clear()
-                    if stream.send_credit <= 0:
-                        await stream.credit_event.wait()
-                    if stream.closed:
-                        return
-                    continue
-                n = min(self.cfg.max_frame_size, stream.send_credit)
-                chunk = await stream.reader.read(n)
-                if chunk == b"":
-                    # EOF on the local socket -> half-close this direction.
-                    # Send FIN on the ordered (data) queue so it cannot overtake
-                    # this stream's own DATA frames on the wire.
-                    if not stream.fin_sent:
-                        stream.fin_sent = True
-                        self.send_ordered(Frame(FIN, 0, sid, b""))
-                    self._try_finish(stream)
-                    return
-                stream.send_credit -= len(chunk)
-                self.send_data(Frame(DATA, 0, sid, chunk))
-        except (asyncio.CancelledError, ConnectionError, OSError):
-            pass
-        finally:
-            if not stream.closed and not stream.fin_sent:
-                # Local socket died unexpectedly -> request full close. Run the
-                # teardown as a separate task: ``close_stream`` cancels this
-                # stream's relay tasks, so awaiting it here from inside
-                # ``_relay_to_peer`` (itself a relay task) would self-cancel and
-                # drop the un-awaited half of the teardown.
-                self.send_control(Frame(CLOSE, 0, sid, b""))
-                self._start_close(stream, "local socket read error")
-
-    async def _relay_from_peer(self, stream: Stream) -> None:
-        """Peer data -> local socket, with flow-control acks and finalization."""
-        sid = stream.stream_id
-        try:
-            while not stream.closed:
-                f = await stream.data_q.get()
-                if stream.closed:
-                    break
-                if f.type == DATA:
-                    stream.writer.write(f.payload)
-                    await stream.writer.drain()
-                    stream.pending_ack += len(f.payload)
-                    if stream.pending_ack >= stream.window_size // 2:
-                        self.send_control(Frame(
-                            WINDOW_UPDATE, 0, sid,
-                            struct.pack("!I", stream.pending_ack)))
-                        stream.pending_ack = 0
-                elif f.type == FIN:
-                    # All DATA preceding this FIN has been flushed in order.
-                    # Now safely half-close the write side of the local socket.
-                    self._half_close_recv(stream)
-                    break
-        except (asyncio.CancelledError, ConnectionError, OSError, RuntimeError):
-            pass
-        finally:
-            if stream.pending_ack > 0 and not stream.closed:
-                self.send_control(Frame(WINDOW_UPDATE, 0, sid,
-                                        struct.pack("!I", stream.pending_ack)))
-                stream.pending_ack = 0
-            if not stream.closed:
-                self._try_finish(stream)
-
-    # -- half-close / close --------------------------------------------------
-
-    def _half_close_recv(self, stream: Stream) -> None:
-        """FIN received: shutdown(SHUT_WR) on the local socket."""
-        try:
-            stream.writer.write_eof()
-        except (ConnectionError, OSError, AttributeError):
-            pass
-
-    def _start_close(self, stream: Stream, why: str) -> None:
-        """Spawn (and track) an asynchronous stream teardown task."""
-        t = asyncio.create_task(self.close_stream(stream, why))
-        self._close_tasks.append(t)
-
-    def _try_finish(self, stream: Stream) -> None:
-        """Close the stream once both directions have fully finished.
-
-        Called from both relay tasks at their natural completion. It only fires
-        once the peer->local queue is drained, so trailing DATA frames are never
-        dropped before finalization.
-        """
-        if (not stream.closed and stream.fin_sent and stream.fin_received
-                and stream.data_q.empty()):
-            self.send_control(Frame(CLOSE, 0, stream.stream_id, b""))
-            self._start_close(stream, "both FINs exchanged")
-
-    async def close_stream(self, stream: Stream, why: str) -> None:
-        if stream.closed:
-            return
-        stream.closed = True
-        log.debug("closing stream %d: %s", stream.stream_id, why)
-        current = asyncio.current_task()
-        relay_tasks = []
-        for t in (stream.send_task, stream.recv_task):
-            # Never cancel ourselves (close_stream may be invoked from within a
-            # relay task); cancelling the current task would abort this teardown
-            # before it can await the peer relay task.
-            if t is not None and t is not current and not t.done():
-                t.cancel()
-                relay_tasks.append(t)
-        try:
-            stream.writer.close()
-        except (ConnectionError, OSError):
-            pass
-        await asyncio.gather(*relay_tasks, return_exceptions=True)
-        try:
-            await stream.writer.wait_closed()
-        except (ConnectionError, OSError, asyncio.CancelledError):
-            pass
-        self.streams.pop(stream.stream_id, None)
-
-    # -- writer pump ----------------------------------------------------------
-
-    async def _writer_pump(self) -> None:
-        pending_getters: set[asyncio.Task] = set()
-        try:
-            while True:
-                if not self.high_queue.empty():
-                    self.writer.write(self.high_queue.get_nowait().to_bytes())
-                    await self.writer.drain()
-                    continue
-                if not self.normal_queue.empty():
-                    self.writer.write(self.normal_queue.get_nowait().to_bytes())
-                    await self.writer.drain()
-                    continue
-                # Nothing ready: wait for either queue (high preferred). The
-                # losing ``Queue.get()`` task is cancelled so it can't stay
-                # suspended. (The hot path here matches a plain two-task wait.)
-                high_t = asyncio.create_task(self.high_queue.get())
-                normal_t = asyncio.create_task(self.normal_queue.get())
-                pending_getters = {high_t, normal_t}
-                done, pending = await asyncio.wait(
-                    {high_t, normal_t}, return_when=asyncio.FIRST_COMPLETED)
-                for t in pending:
-                    t.cancel()
-                for t in done:
-                    self.writer.write(t.result().to_bytes())
-                await self.writer.drain()
-        except (asyncio.CancelledError, ConnectionError, OSError, EOFError):
-            pass
-        finally:
-            # If this pump is cancelled/errors mid-wait, the (uncancelled, still
-            # pending) queue-getters from that last iteration would otherwise be
-            # reported as "Task was destroyed but it is pending". Reap them.
-            for t in pending_getters:
-                if not t.done():
-                    t.cancel()
-            if pending_getters:
-                await asyncio.gather(*pending_getters, return_exceptions=True)
-
-    # -- keepalive -------------------------------------------------------------
-
-    async def _keepalive_loop(self) -> None:
-        interval = float(self.cfg.keepalive)
-        misses = 0
-        try:
-            while self.connected:
-                await asyncio.sleep(interval)
-                if not self.connected:
-                    return
-                self._pong_event = asyncio.Event()
-                self.send_control(Frame(PING, 0, 0, b""))
-                try:
-                    await asyncio.wait_for(self._pong_event.wait(), interval * 3)
-                    misses = 0
-                except TimeoutError:
-                    misses += 1
-                    log.warning("keepalive miss %d (no PONG)", misses)
-                    if misses >= 3:
-                        log.warning("control considered dead")
-                        self.connected = False
-                        try:
-                            self.writer.close()
-                        except (ConnectionError, OSError):
-                            pass
-                        return
-        except asyncio.CancelledError:
-            pass
-
-    # -- teardown --------------------------------------------------------------
-
-    async def shutdown_conn(self) -> None:
-        """Close the control socket and all streams. Idempotent."""
-        if self._torn:
-            return
-        self._torn = True
-        self.connected = False
-        streams = list(self.streams.values())
-        for stream in streams:
-            await self.close_stream(stream, "teardown")
-        tasks = [self._writer_task] + [t for t in self._tasks if t is not self._writer_task]
-        for t in tasks:
-            if t is not None and not t.done():
-                t.cancel()
-        if tasks:
-            await asyncio.gather(*(t for t in tasks if t is not None),
-                                 return_exceptions=True)
-        # Reap any asynchronously-spawned stream teardown tasks so they do not
-        # remain pending (and warn "Task was destroyed") at loop teardown.
-        close_tasks = [t for t in self._close_tasks if not t.done()]
-        if close_tasks:
-            await asyncio.gather(*close_tasks, return_exceptions=True)
-        self._close_tasks.clear()
-        try:
-            self.writer.close()
-        except (ConnectionError, OSError):
-            pass
-
-    # -- keep-streams helpers ---------------------------------------------------
-
-    def take_preserved(self) -> list:
-        """Detach streams that should survive a control break (client, keep-streams).
-
-        Returns a list of ``PreservedStream`` records. The relay tasks are
-        cancelled but the local sockets are NOT closed, so the user connection
-        stays alive and can be re-attached after a reconnect.
-        """
-        preserved = []
-        for sid, s in list(self.streams.items()):
-            if s.target is None:
-                continue
-            for t in (s.send_task, s.recv_task):
-                if t is not None and not t.done():
-                    t.cancel()
-            s.closed = True  # detach from this (dead) control connection
-            preserved.append(PreservedStream(
-                sid, s.reader, s.writer, s.target, s.fin_sent))
-            self.streams.pop(sid, None)
-        return preserved
+        stream = Stream(
+            stream_id,
+            reader,
+            writer,
+            self.args,
+            initiator=False,
+            streams=self.streams,
+        )
+        stream.attach(self)
+        self.streams[stream_id] = stream
+        stream.start()
+        LOG.info("stream %d: connected to %s:%d", stream_id, host, port)
+        self.send_frame(Frame(F_OPEN_OK, stream_id), high=True)
 
 
 # ---------------------------------------------------------------------------
-# PreservedStream (for --keep-streams on the client)
+# Handshake
 # ---------------------------------------------------------------------------
 
+async def client_handshake(tunnel: Tunnel, token: str) -> None:
+    """Perform the client side of the HELLO exchange."""
+    token_bytes = token.encode("utf-8")
+    payload = struct.pack("!HH", PROTOCOL_VERSION, len(token_bytes)) + token_bytes
+    tunnel.writer.write(encode_frame(Frame(F_HELLO, 0, payload)))
+    await tunnel.writer.drain()
 
-@dataclass
-class PreservedStream:
-    stream_id: int
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-    target: tuple[str, int]
-    fin_sent: bool = False
+    try:
+        frame = await asyncio.wait_for(
+            read_frame(tunnel.reader, tunnel.max_frame_size), HANDSHAKE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        raise HandshakeError("timeout waiting for HELLO_OK")
 
-    def close(self) -> None:
-        try:
-            self.writer.close()
-        except (ConnectionError, OSError):
-            pass
+    if frame.stream_id != 0:
+        raise HandshakeError("unexpected stream id in handshake reply")
+    if frame.type == F_HELLO_OK:
+        return
+    if frame.type == F_HELLO_ERR:
+        reason = frame.payload[0] if frame.payload else HELLO_ERR_OTHER
+        raise HandshakeError(f"server rejected handshake (reason {reason})")
+    raise HandshakeError(f"unexpected frame 0x{frame.type:02x} during handshake")
+
+
+async def server_handshake(tunnel: Tunnel, token: str) -> None:
+    """Perform the server side of the HELLO exchange."""
+    try:
+        frame = await asyncio.wait_for(
+            read_frame(tunnel.reader, tunnel.max_frame_size), HANDSHAKE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        raise HandshakeError("timeout waiting for HELLO")
+
+    if frame.type != F_HELLO or frame.stream_id != 0:
+        raise HandshakeError("expected HELLO frame")
+    if len(frame.payload) < 4:
+        raise HandshakeError("malformed HELLO payload")
+
+    version, token_len = struct.unpack_from("!HH", frame.payload, 0)
+    if len(frame.payload) != 4 + token_len:
+        raise HandshakeError("malformed HELLO payload")
+
+    if version != PROTOCOL_VERSION:
+        tunnel.writer.write(
+            encode_frame(Frame(F_HELLO_ERR, 0, bytes([HELLO_ERR_VERSION])))
+        )
+        await tunnel.writer.drain()
+        raise HandshakeError(f"protocol version mismatch ({version})")
+
+    try:
+        received = frame.payload[4:4 + token_len].decode("utf-8")
+    except UnicodeDecodeError:
+        received = ""
+
+    if not hmac.compare_digest(received, token):
+        tunnel.writer.write(
+            encode_frame(Frame(F_HELLO_ERR, 0, bytes([HELLO_ERR_TOKEN])))
+        )
+        await tunnel.writer.drain()
+        raise HandshakeError("invalid token")
+
+    tunnel.writer.write(encode_frame(Frame(F_HELLO_OK, 0)))
+    await tunnel.writer.drain()
 
 
 # ---------------------------------------------------------------------------
-# Forward listener
+# Client
 # ---------------------------------------------------------------------------
 
+def spawn_outgoing_stream(
+    tunnel: Tunnel,
+    args: argparse.Namespace,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    target: Tuple[str, int],
+) -> Stream:
+    """Create an initiator-side stream and start it."""
+    stream_id = tunnel.alloc_id()
+    stream = Stream(
+        stream_id,
+        reader,
+        writer,
+        args,
+        initiator=True,
+        streams=tunnel.streams,
+        target=target,
+    )
+    tunnel.streams[stream_id] = stream
+    stream.attach(tunnel)
+    stream.start()
+    return stream
 
-class ForwardListener:
-    """Accepts local TCP connections and turns each into an OPEN on a tunnel."""
 
-    def __init__(self, bind: tuple[str, int], target: tuple[str, int]):
-        self.bind = bind
-        self.target = target
-        self.tunnel: Tunnel|None = None
-        self.server: asyncio.Server|None = None
+class Client:
+    """Client side: owns the persistent stream table and local listeners."""
 
-    async def start(self, tunnel: Tunnel|None) -> None:
-        self.tunnel = tunnel
-        self.server = await asyncio.start_server(self._on_client, self.bind[0],
-                                                 self.bind[1])
-        log.info("forwarding %s:%d -> %s:%d",
-                 self.bind[0], self.bind[1], self.target[0], self.target[1])
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.allow = AllowPolicy(args.allow, args.allow_all)
+        self.streams: Dict[int, Stream] = {}
+        self.next_id = 1
+        self.tunnel: Optional[Tunnel] = None
+        self.servers: List[asyncio.AbstractServer] = []
 
-    async def stop(self) -> None:
-        if self.server is not None:
-            self.server.close()
-            # Deliberately do NOT await ``wait_closed()`` here. In 3.12+ that
-            # waits for every accepted local connection to be fully dropped, but
-            # those sockets are owned by streams (which may stay half-open, or
-            # be preserved by ``--keep-streams``), not by this listener. We only
-            # need to stop accepting new connections; existing sockets are
-            # closed (or preserved) by the tunnel teardown.
-            self.server = None
+    # -- listeners ----------------------------------------------------------
 
-    async def _on_client(self, reader, writer) -> None:
+    async def start_listeners(self) -> None:
+        for spec in self.args.forward:
+            bind_host, bind_port, target_host, target_port = parse_forward(spec)
+            handler = functools.partial(
+                self._on_local_connection,
+                target_host=target_host,
+                target_port=target_port,
+            )
+            server = await asyncio.start_server(handler, bind_host, bind_port)
+            self.servers.append(server)
+            LOG.info(
+                "forwarding %s:%d -> %s:%d",
+                bind_host,
+                bind_port,
+                target_host,
+                target_port,
+            )
+
+    async def _on_local_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        target_host: str,
+        target_port: int,
+    ) -> None:
         tunnel = self.tunnel
-        if tunnel is None or not tunnel.connected:
-            log.warning("no active tunnel; dropping connection on %s", self.bind[0])
+        if tunnel is None:
+            LOG.warning("no active control connection, rejecting local connection")
             writer.close()
             return
-        sid = tunnel.next_stream_id
-        tunnel.next_stream_id += 2
-        th, tp = self.target
-        bytes_host = th.encode("utf-8")
-        payload = (struct.pack("!H", len(bytes_host)) + bytes_host
-                   + struct.pack("!H", tp))
-        stream = Stream(sid, reader, writer, tunnel.cfg.window_size,
-                        tunnel.cfg.window_size, target=self.target)
-        tunnel.streams[sid] = stream
-        tunnel.send_control(Frame(OPEN, 0, sid, payload))
-        log.debug("stream %d: OPEN %s:%d", sid, th, tp)
+        try:
+            spawn_outgoing_stream(
+                tunnel, self.args, reader, writer, (target_host, target_port)
+            )
+        except Exception as exc:
+            LOG.warning("could not create stream: %s", exc)
+            writer.close()
 
+    # -- sessions -----------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
+    async def session(self) -> int:
+        """Run one control-connection session.  Returns 0 only on clean stop."""
+        host, port = parse_host_port(self.args.connect)
+        try:
+            reader, writer = await asyncio.open_connection(host, port)
+        except OSError as exc:
+            LOG.error("cannot connect to %s:%d: %s", host, port, exc)
+            return 1
 
-
-class App:
-    def __init__(self, args):
-        self.args = args
-        self.allow_policy = AllowPolicy(args.allow_all, args.allows)
-        self.forwards = args.forwards
-        self.tunnel: Tunnel|None = None
-        self._preserved: list[PreservedStream] = []
-        # Server mode: active per-connection handler tasks.
-        self._conn_tasks: set[asyncio.Task] = set()
-
-    def _make_config(self) -> Config:
-        return Config(
-            token=self.args.token,
-            forwards=self.forwards,
-            window_size=self.args.window_size,
-            max_frame_size=self.args.max_frame_size,
-            keepalive=self.args.keepalive,
+        tunnel = Tunnel(
+            reader,
+            writer,
+            is_client=True,
+            args=self.args,
+            streams=self.streams,
+            allow=self.allow,
+            next_id=self.next_id,
         )
 
-    async def _start_forwards(self, tunnel: Tunnel) -> list[ForwardListener]:
-        listeners = []
         try:
-            for bind, target in self.forwards:
-                fl = ForwardListener(bind, target)
-                await fl.start(tunnel)
-                listeners.append(fl)
-        except OSError as exc:
-            await self._stop_forwards(listeners)
-            raise exc
-        return listeners
+            await client_handshake(tunnel, self.args.token)
+        except Exception as exc:
+            LOG.error("handshake failed: %s", exc)
+            writer.close()
+            return 1
 
-    async def _stop_forwards(self, listeners: list[ForwardListener]) -> None:
-        for fl in listeners:
-            await fl.stop()
+        LOG.info("control connection established to %s:%d", host, port)
+        self.tunnel = tunnel
 
-    # -- client ---------------------------------------------------------------
-
-    async def run_client(self) -> int:
-        host, port = self.args.connect
-        reconnect = self.args.reconnect
-        keep_streams = self.args.keep_streams
-
-        while True:
-            # (Re)connect to the server.
-            try:
-                r, w = await asyncio.open_connection(host, port)
-            except (OSError, ConnectionError) as exc:
-                log.error("cannot connect to %s:%d: %s", host, port, exc)
-                if reconnect is None:
-                    return 1
-                await self._sleep_cancel(reconnect)
+        # Re-open streams preserved from a previous session.
+        for stream in list(self.streams.values()):
+            if stream.closed:
+                self.streams.pop(stream.id, None)
                 continue
+            if stream.initiator and stream.target is not None:
+                stream.reopen(tunnel)
+            else:
+                stream.close("control connection lost")
 
-            tunnel = Tunnel(r, w, is_client=True, cfg=self._make_config(),
-                            allow_policy=self.allow_policy)
-            self.tunnel = tunnel
-            log.info("connected to %s:%d", host, port)
-
-            ok = await tunnel.client_handshake()
-            if not ok:
-                await tunnel.shutdown_conn()
-                # Handshake failed: preserved streams can't carry over.
-                self._close_preserved()
-                if reconnect is None:
-                    return 1
-                await self._sleep_cancel(reconnect)
-                continue
-
-            # Start local forward listeners.
-            listeners = await self._start_forwards(tunnel)
-            tunnel.run_context()
-
-            # Re-OPEN any streams preserved across a previous break.
-            if keep_streams and self._preserved:
-                await self._reopen_preserved(tunnel)
-
-            try:
-                # Serve until the control connection drops.
-                await tunnel.read_frames_until_eof()
-            finally:
-                # Preserve streams (if requested) before tearing down, so that
-                # shutdown_conn does not close the local sockets we keep. This
-                # also runs on signal cancellation, guaranteeing cleanup.
-                await self._stop_forwards(listeners)
-                if keep_streams:
-                    surviving = tunnel.take_preserved()
-                    # Drop previously preserved streams we can no longer keep.
-                    self._close_preserved()
-                    self._preserved = surviving
-                else:
-                    self._close_preserved()
-                await tunnel.shutdown_conn()
-
-            if reconnect is None:
-                log.error("control connection lost and --reconnect not set")
-                self._close_preserved()
-                return 1
-            log.info("reconnecting in %.1fs", reconnect)
-            await self._sleep_cancel(reconnect)
-
-    async def _reopen_preserved(self, tunnel: Tunnel) -> None:
-        for p in list(self._preserved):
-            # Re-create the stream record on the new tunnel using the preserved
-            # local sockets. OPEN_OK will then find it and start the relay; an
-            # OPEN_ERR closes the preserved local connection.
-            if p.stream_id not in tunnel.streams:
-                stream = Stream(p.stream_id, p.reader, p.writer,
-                                tunnel.cfg.window_size, tunnel.cfg.window_size,
-                                target=p.target, fin_sent=p.fin_sent)
-                tunnel.streams[p.stream_id] = stream
-            th, tp = p.target
-            bytes_host = th.encode("utf-8")
-            payload = (struct.pack("!H", len(bytes_host)) + bytes_host
-                       + struct.pack("!H", tp))
-            tunnel.send_control(Frame(OPEN, 0, p.stream_id, payload))
-            log.debug("re-OPEN preserved stream %d -> %s:%d", p.stream_id, th, tp)
-        # Preserved streams are handed to the tunnel; the app no longer owns them.
-        self._preserved = []
-
-    def _close_preserved(self) -> None:
-        for p in self._preserved:
-            p.close()
-        self._preserved = []
-
-    async def _sleep_cancel(self, secs: float) -> None:
         try:
-            await asyncio.sleep(secs)
-        except asyncio.CancelledError:
-            # TODO: the same exception raised
-            raise
-
-    # -- server ---------------------------------------------------------------
-
-    async def run_server(self) -> int:
-        host, port = self.args.listen
-        listeners = []
-
-        # Server's own local forwards; they attach to whichever control
-        # connection is currently active.
-        for bind, target in self.forwards:
-            fl = ForwardListener(bind, target)
-            try:
-                await fl.start(None)
-            except OSError as exc:
-                log.error("cannot bind %s:%d: %s", bind[0], bind[1], exc)
-                await self._stop_forwards(listeners)
-                return 1
-            listeners.append(fl)
-
-        # Server-side local forwards created a stream with an id computed from
-        # the tunnel's counter; ForwardListener picks it up dynamically.
-        async def handle_conn(reader, writer):
-            peer = writer.get_extra_info("peername")
-            log.info("control connection from %r", peer)
-            tunnel = Tunnel(reader, writer, is_client=False, cfg=self._make_config(),
-                            allow_policy=self.allow_policy)
-            self.tunnel = tunnel
-            for fl in listeners:
-                fl.tunnel = tunnel
-            try:
-                ok = await tunnel.server_handshake()
-                if not ok:
-                    return
-                tunnel.run_context()
-                await tunnel.read_frames_until_eof()
-            finally:
-                await tunnel.shutdown_conn()
-                for fl in listeners:
-                    fl.tunnel = None
-                if self.tunnel is tunnel:
-                    self.tunnel = None
-                log.info("control connection closed")
-
-        async def _connection_wrapper(reader, writer):
-            task = asyncio.current_task()
-            if not task:
-                return
-            self._conn_tasks.add(task)
-            try:
-                await handle_conn(reader, writer)
-            finally:
-                self._conn_tasks.discard(task)
-
-        server = await asyncio.start_server(_connection_wrapper, host, port)
-        log.info("server listening on %s:%d", host, port)
-        try:
-            # ``asyncio.start_server`` already begins accepting connections, so
-            # we do not call ``server.serve_forever()``. That method swallows
-            # ``CancelledError`` internally and then blocks in its own
-            # ``wait_closed()`` until every accepted client handler finishes, so
-            # on shutdown the CancelledError would never reach this ``finally``
-            # block (we would deadlock waiting on connections we can't yet
-            # cancel). Instead we idle here and let cancellation propagate, then
-            # tear down the connection handlers before closing the server.
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            pass
+            await tunnel.run()
         finally:
-            # Stop the accept loop and any remaining per-connection handlers.
-            for t in list(self._conn_tasks):
-                t.cancel()
-            if self._conn_tasks:
-                await asyncio.gather(*list(self._conn_tasks), return_exceptions=True)
-            server.close()
-            # Safe now: every accepted client handler has finished, so nothing
-            # is left for ``wait_closed()`` to block on.
-            await server.wait_closed()
-            await self._stop_forwards(listeners)
-        return 0
+            self.next_id = tunnel.next_id
+            self.tunnel = None
+            if self.args.keep_streams:
+                for stream in list(self.streams.values()):
+                    stream.detach()
+            else:
+                for stream in list(self.streams.values()):
+                    stream.close("control connection lost")
+                self.streams.clear()
+
+        LOG.info("control connection lost")
+        return 1
+
+
+async def run_client(args: argparse.Namespace) -> int:
+    client = Client(args)
+    await client.start_listeners()
+
+    if args.reconnect is None:
+        return await client.session()
+
+    while True:
+        await client.session()
+        LOG.info("reconnecting in %.1f seconds", args.reconnect)
+        await asyncio.sleep(args.reconnect)
 
 
 # ---------------------------------------------------------------------------
-# CLI / entry point
+# Server
 # ---------------------------------------------------------------------------
 
+class Server:
+    """Server side: accepts control connections and serves local forwards."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.allow = AllowPolicy(args.allow, args.allow_all)
+        self.tunnel: Optional[Tunnel] = None
+        self.servers: List[asyncio.AbstractServer] = []
+
+    async def start_listeners(self) -> None:
+        for spec in self.args.forward:
+            bind_host, bind_port, target_host, target_port = parse_forward(spec)
+            handler = functools.partial(
+                self._on_local_connection,
+                target_host=target_host,
+                target_port=target_port,
+            )
+            server = await asyncio.start_server(handler, bind_host, bind_port)
+            self.servers.append(server)
+            LOG.info(
+                "forwarding %s:%d -> %s:%d",
+                bind_host,
+                bind_port,
+                target_host,
+                target_port,
+            )
+
+    async def _on_local_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        target_host: str,
+        target_port: int,
+    ) -> None:
+        tunnel = self.tunnel
+        if tunnel is None:
+            LOG.warning("no active control connection, rejecting local connection")
+            writer.close()
+            return
+        try:
+            spawn_outgoing_stream(
+                tunnel, self.args, reader, writer, (target_host, target_port)
+            )
+        except Exception as exc:
+            LOG.warning("could not create stream: %s", exc)
+            writer.close()
+
+    async def handle_control(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        peer = writer.get_extra_info("peername")
+        LOG.info("incoming control connection from %s", peer)
+
+        tunnel = Tunnel(
+            reader,
+            writer,
+            is_client=False,
+            args=self.args,
+            allow=self.allow,
+        )
+
+        try:
+            await server_handshake(tunnel, self.args.token)
+        except Exception as exc:
+            LOG.warning("handshake with %s failed: %s", peer, exc)
+            writer.close()
+            return
+
+        LOG.info("control connection established with %s", peer)
+        self.tunnel = tunnel
+
+        try:
+            await tunnel.run()
+        finally:
+            for stream in list(tunnel.streams.values()):
+                stream.close("control connection lost")
+            tunnel.streams.clear()
+            if self.tunnel is tunnel:
+                self.tunnel = None
+            LOG.info("control connection with %s closed", peer)
+
+
+async def run_server(args: argparse.Namespace) -> int:
+    server = Server(args)
+    await server.start_listeners()
+
+    host, port = parse_host_port(args.listen)
+    control = await asyncio.start_server(server.handle_control, host, port)
+    LOG.info("listening on %s:%d", host, port)
+
+    async with control:
+        await control.serve_forever()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="tunnel",
-        description="TCP port forwarding tunnel over a binary multiplexed protocol.",
+    parser = argparse.ArgumentParser(
+        prog="tunnel.py",
+        description="TCP port forwarding tunnel over a single TCP connection.",
     )
-    sub = p.add_subparsers(dest="mode", required=True)
+    sub = parser.add_subparsers(dest="mode", required=True)
 
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--token", required=True, help="shared secret token")
-    common.add_argument("--forward", action="append", default=[],
-                        metavar="BIND_HOST:BIND_PORT:TARGET_HOST:TARGET_PORT",
-                        help="local forward; repeatable")
-    common.add_argument("--allow", action="append", default=[],
-                        metavar="HOST:PORT", help="allowed target; repeatable")
-    common.add_argument("--allow-all", action="store_true", help="allow any target")
-    common.add_argument("--window-size", type=int, default=262144,
-                        help="flow-control window size (default 262144)")
-    common.add_argument("--max-frame-size", type=int, default=65536,
-                        help="max frame payload (default 65536)")
-    common.add_argument("--keepalive", type=float, default=30.0,
-                        help="PING interval seconds (default 30)")
-    common.add_argument("--log-level", default="info",
-                        choices=["debug", "info", "warning", "error"],
-                        help="logging level (default info)")
+    def add_common(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--token", required=True, help="shared secret (required)")
+        sp.add_argument(
+            "--forward",
+            action="append",
+            default=[],
+            metavar="BIND_HOST:BIND_PORT:TARGET_HOST:TARGET_PORT",
+            help="local forward (repeatable)",
+        )
+        sp.add_argument(
+            "--allow",
+            action="append",
+            default=[],
+            metavar="HOST:PORT",
+            help="allow a specific target (repeatable)",
+        )
+        sp.add_argument(
+            "--allow-all", action="store_true", help="allow any target"
+        )
+        sp.add_argument(
+            "--window-size",
+            type=int,
+            default=262144,
+            metavar="BYTES",
+            help="flow-control window size (default 262144)",
+        )
+        sp.add_argument(
+            "--max-frame-size",
+            type=int,
+            default=65536,
+            metavar="BYTES",
+            help="maximum frame payload (default 65536)",
+        )
+        sp.add_argument(
+            "--keepalive",
+            type=float,
+            default=30.0,
+            metavar="SECONDS",
+            help="PING period (default 30)",
+        )
+        sp.add_argument(
+            "--log-level", default="info", help="logging level (default info)"
+        )
 
-    c = sub.add_parser("client", parents=[common])
-    c.add_argument("--connect", required=True, metavar="HOST:PORT", help="server address")
-    c.add_argument("--reconnect", type=float, metavar="SECONDS",
-                   help="reconnect every N seconds after control break")
-    c.add_argument("--keep-streams", action="store_true",
-                   help="preserve active streams across reconnects")
+    client = sub.add_parser("client", help="connect to the peer")
+    add_common(client)
+    client.add_argument(
+        "--connect", required=True, metavar="HOST:PORT", help="server address"
+    )
+    client.add_argument(
+        "--reconnect",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="reconnect every N seconds",
+    )
+    client.add_argument(
+        "--keep-streams",
+        action="store_true",
+        help="preserve active streams between reconnects (requires --reconnect)",
+    )
 
-    s = sub.add_parser("server", parents=[common])
-    s.add_argument("--listen", required=True, metavar="HOST:PORT", help="listening address")
-    return p
+    server = sub.add_parser("server", help="accept a peer connection")
+    add_common(server)
+    server.add_argument(
+        "--listen", required=True, metavar="HOST:PORT", help="listening address"
+    )
 
-
-def _validate(args) -> None:
-    if args.forward:
-        args.forwards = [parse_forward(x) for x in args.forward]
-    else:
-        args.forwards = []
-    if args.allow:
-        args.allows = [parse_host_port(x, "--allow") for x in args.allow]
-    else:
-        args.allows = []
-    if args.allow_all and args.allow:
-        _fail("--allow and --allow-all are mutually exclusive")
-    if args.window_size <= 0 or args.max_frame_size <= 0:
-        _fail("--window-size and --max-frame-size must be positive")
-    if args.token == "":
-        _fail("--token must not be empty")
-    if args.mode == "client":
-        args.connect = parse_host_port(args.connect, "--connect")
-        if args.keep_streams and args.reconnect is None:
-            _fail("--keep-streams requires --reconnect")
-    else:
-        args.listen = parse_host_port(args.listen, "--listen")
-        if getattr(args, "keep_streams", False):
-            _fail("--keep-streams is client-only")
+    return parser
 
 
-def _fail(msg: str):
-    print(f"error: {msg}", file=sys.stderr)
-    sys.exit(2)
+def setup_logging(level: str) -> None:
+    numeric = getattr(logging, str(level).upper(), None)
+    if not isinstance(numeric, int):
+        numeric = logging.INFO
+    logging.basicConfig(
+        level=numeric,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main() -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    args = parser.parse_args()
+    setup_logging(args.log_level)
+
+    # Validation -----------------------------------------------------------
+    if args.allow and args.allow_all:
+        parser.error("--allow and --allow-all are mutually exclusive")
+    if args.window_size <= 0:
+        parser.error("--window-size must be positive")
+    if args.max_frame_size <= 0:
+        parser.error("--max-frame-size must be positive")
+    if args.keepalive < 0:
+        parser.error("--keepalive must not be negative")
+
+    if args.mode == "client":
+        if args.keep_streams and args.reconnect is None:
+            parser.error("--keep-streams requires --reconnect")
+
+    # Parse configuration strings early so that errors surface immediately.
     try:
-        _validate(args)
+        for spec in args.allow:
+            parse_host_port(spec)
+        for spec in args.forward:
+            parse_forward(spec)
+        if args.mode == "client":
+            parse_host_port(args.connect)
+        else:
+            parse_host_port(args.listen)
     except ValueError as exc:
-        _fail(str(exc))
+        parser.error(str(exc))
 
-    app = App(args)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    stop = asyncio.Event()
     try:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, stop.set)
-            except (NotImplementedError, RuntimeError):
-                pass
-        main_task = asyncio.ensure_future(
-            app.run_client() if args.mode == "client" else app.run_server())
-
-        async def _wait() -> int:
-            signal_task = asyncio.ensure_future(stop.wait())
-            try:
-                done, _ = await asyncio.wait(
-                    {main_task, signal_task}, return_when=asyncio.FIRST_COMPLETED)
-                if signal_task in done and not main_task.done():
-                    log.info("received shutdown signal")
-                    main_task.cancel()
-                    try:
-                        await main_task
-                    except asyncio.CancelledError:
-                        pass
-                    return 0
-                return main_task.result()
-            finally:
-                # Avoid leaving a dangling Event.wait() task that would be
-                # reported as "destroyed but still pending" when the main task
-                # finishes first (e.g. a failed handshake / connect error).
-                if not signal_task.done():
-                    signal_task.cancel()
-
-        return loop.run_until_complete(_wait())
+        if args.mode == "client":
+            return asyncio.run(run_client(args))
+        return asyncio.run(run_server(args))
     except KeyboardInterrupt:
-        return 130
-    finally:
-        try:
-            loop.close()
-        except RuntimeError:
-            pass
-
-
-def encode_frame(f: Frame) -> bytes:
-    return f.to_bytes()
+        LOG.info("interrupted")
+        return 0
 
 
 if __name__ == "__main__":
