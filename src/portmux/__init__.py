@@ -29,7 +29,6 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 LOG = logging.getLogger("tunnel")
 
@@ -39,9 +38,9 @@ LOG = logging.getLogger("tunnel")
 
 PROTOCOL_VERSION = 1
 
-HANDSHAKE_TIMEOUT = 10.0     # seconds to wait for HELLO / HELLO_OK
-CONNECT_TIMEOUT = 30.0       # seconds to wait for the target TCP connection
-OPEN_TIMEOUT = 30.0          # seconds to wait for OPEN_OK / OPEN_ERR
+HANDSHAKE_TIMEOUT = 10.0  # seconds to wait for HELLO / HELLO_OK
+CONNECT_TIMEOUT = 30.0  # seconds to wait for the target TCP connection
+OPEN_TIMEOUT = 30.0  # seconds to wait for OPEN_OK / OPEN_ERR
 CREDIT_FLUSH_INTERVAL = 0.05  # 50 ms window-update aggregation timer
 
 # --- frame types -----------------------------------------------------------
@@ -85,6 +84,7 @@ HEADER = struct.Struct("!BBII")
 # Errors
 # ---------------------------------------------------------------------------
 
+
 class ProtocolError(Exception):
     """Any protocol violation: the control connection is closed immediately."""
 
@@ -104,6 +104,7 @@ class OpenFailure(Exception):
 # ---------------------------------------------------------------------------
 # Frames
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Frame:
@@ -126,9 +127,7 @@ async def read_frame(reader: asyncio.StreamReader, max_frame_size: int) -> Frame
     header = await reader.readexactly(HEADER.size)
     ftype, flags, stream_id, length = HEADER.unpack(header)
     if length > max_frame_size:
-        raise ProtocolError(
-            f"frame payload too large: {length} > {max_frame_size}"
-        )
+        raise ProtocolError(f"frame payload too large: {length} > {max_frame_size}")
     payload = await reader.readexactly(length) if length else b""
     return Frame(type=ftype, stream_id=stream_id, payload=payload, flags=flags)
 
@@ -139,7 +138,7 @@ def encode_open(host: str, port: int) -> bytes:
     return struct.pack("!H", len(host_bytes)) + host_bytes + struct.pack("!H", port)
 
 
-def decode_open(payload: bytes) -> Tuple[str, int]:
+def decode_open(payload: bytes) -> tuple[str, int]:
     """Parse an OPEN payload."""
     if len(payload) < 4:
         raise ProtocolError("malformed OPEN payload")
@@ -147,7 +146,7 @@ def decode_open(payload: bytes) -> Tuple[str, int]:
     if len(payload) != 2 + host_len + 2:
         raise ProtocolError("malformed OPEN payload")
     try:
-        host = payload[2:2 + host_len].decode("utf-8")
+        host = payload[2 : 2 + host_len].decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ProtocolError("OPEN host is not valid UTF-8") from exc
     port = struct.unpack_from("!H", payload, 2 + host_len)[0]
@@ -158,7 +157,8 @@ def decode_open(payload: bytes) -> Tuple[str, int]:
 # Small helpers
 # ---------------------------------------------------------------------------
 
-def parse_host_port(spec: str) -> Tuple[str, int]:
+
+def parse_host_port(spec: str) -> tuple[str, int]:
     """Parse ``HOST:PORT`` (IPv4 or hostname only, no brackets)."""
     if spec.count(":") != 1:
         raise ValueError(f"invalid HOST:PORT value: {spec!r}")
@@ -168,7 +168,7 @@ def parse_host_port(spec: str) -> Tuple[str, int]:
     return host, int(port_str)
 
 
-def parse_forward(spec: str) -> Tuple[str, int, str, int]:
+def parse_forward(spec: str) -> tuple[str, int, str, int]:
     """Parse ``BIND_HOST:BIND_PORT:TARGET_HOST:TARGET_PORT``."""
     parts = spec.split(":")
     if len(parts) != 4:
@@ -185,7 +185,7 @@ def parse_forward(spec: str) -> Tuple[str, int, str, int]:
 class AllowPolicy:
     """Decides whether an OPEN request may be served."""
 
-    def __init__(self, allowed: Optional[List[str]], allow_all: bool) -> None:
+    def __init__(self, allowed: list[str] | None, allow_all: bool) -> None:
         self.allow_all = allow_all
         self._allowed = set()
         for spec in allowed or []:
@@ -230,7 +230,7 @@ async def connect_target(host: str, port: int):
             asyncio.open_connection(host, port, family=socket.AF_INET),
             timeout=CONNECT_TIMEOUT,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise OpenFailure(OPEN_ERR_TIMEOUT)
     except socket.gaierror:
         raise OpenFailure(OPEN_ERR_DNS)
@@ -244,6 +244,7 @@ async def connect_target(host: str, port: int):
 # Stream
 # ---------------------------------------------------------------------------
 
+
 class Stream:
     """One logical stream = one local TCP socket on each side."""
 
@@ -254,8 +255,8 @@ class Stream:
         writer: asyncio.StreamWriter,
         args: argparse.Namespace,
         initiator: bool,
-        streams: Dict[int, "Stream"],
-        target: Optional[Tuple[str, int]] = None,
+        streams: dict[int, Stream],
+        target: tuple[str, int] | None = None,
     ) -> None:
         self.id = stream_id
         self.reader = reader
@@ -266,7 +267,7 @@ class Stream:
         self.target = target
         self.streams = streams
 
-        self.tunnel: Optional["Tunnel"] = None
+        self.tunnel: Tunnel | None = None
         self.closed = False
         self.fin_sent = False
         self.fin_received = False
@@ -278,13 +279,13 @@ class Stream:
         self.credit_event = asyncio.Event()
         self.ready_event = asyncio.Event()
         self.open_result = asyncio.Event()
-        self.open_error: Optional[int] = None
+        self.open_error: int | None = None
 
         self.incoming: asyncio.Queue = asyncio.Queue()
 
-        self._open_task: Optional[asyncio.Task] = None
-        self._send_task: Optional[asyncio.Task] = None
-        self._recv_task: Optional[asyncio.Task] = None
+        self._open_task: asyncio.Task | None = None
+        self._send_task: asyncio.Task | None = None
+        self._recv_task: asyncio.Task | None = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -297,7 +298,7 @@ class Stream:
         self._send_task = asyncio.ensure_future(self._local_to_remote())
         self._recv_task = asyncio.ensure_future(self._remote_to_local())
 
-    def attach(self, tunnel: "Tunnel") -> None:
+    def attach(self, tunnel: Tunnel) -> None:
         """Bind the stream to a (new) control connection."""
         self.tunnel = tunnel
         self.send_credit = self.window
@@ -314,7 +315,7 @@ class Stream:
             self._open_task.cancel()
         self._open_task = None
 
-    def reopen(self, tunnel: "Tunnel") -> None:
+    def reopen(self, tunnel: Tunnel) -> None:
         """Re-send OPEN for this stream on a freshly established tunnel."""
         if self.closed:
             return
@@ -345,7 +346,7 @@ class Stream:
         )
         try:
             await asyncio.wait_for(self.open_result.wait(), OPEN_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             LOG.warning("stream %d: OPEN timed out", self.id)
             self.close("open timeout", send_close=True)
             return
@@ -431,7 +432,7 @@ class Stream:
                         data = await asyncio.wait_for(
                             self.incoming.get(), CREDIT_FLUSH_INTERVAL
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         self._flush_credit()
                         continue
                 else:
@@ -547,6 +548,7 @@ class Stream:
 # Tunnel (control connection)
 # ---------------------------------------------------------------------------
 
+
 class Tunnel:
     """Owns the control connection and the stream table."""
 
@@ -556,15 +558,15 @@ class Tunnel:
         writer: asyncio.StreamWriter,
         is_client: bool,
         args: argparse.Namespace,
-        streams: Optional[Dict[int, Stream]] = None,
-        allow: Optional[AllowPolicy] = None,
-        next_id: Optional[int] = None,
+        streams: dict[int, Stream] | None = None,
+        allow: AllowPolicy | None = None,
+        next_id: int | None = None,
     ) -> None:
         self.reader = reader
         self.writer = writer
         self.is_client = is_client
         self.args = args
-        self.streams: Dict[int, Stream] = streams if streams is not None else {}
+        self.streams: dict[int, Stream] = streams if streams is not None else {}
         self.allow = allow or AllowPolicy(args.allow, args.allow_all)
         self.max_frame_size = args.max_frame_size
 
@@ -574,7 +576,7 @@ class Tunnel:
 
         self._closed = asyncio.Event()
         self._stopped = False
-        self._tasks: List[asyncio.Task] = []
+        self._tasks: list[asyncio.Task] = []
 
     # -- id allocation ------------------------------------------------------
 
@@ -652,17 +654,14 @@ class Tunnel:
         interval = float(self.args.keepalive)
         if interval <= 0:
             return
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                if time.monotonic() - self.last_pong > 3 * interval:
-                    LOG.warning("keepalive timeout, dropping control connection")
-                    self._fail()
-                    return
-                self.send_frame(Frame(F_PING, 0), high=True)
-                LOG.debug("sending PING")
-        except asyncio.CancelledError:
-            raise
+        while True:
+            await asyncio.sleep(interval)
+            if time.monotonic() - self.last_pong > 3 * interval:
+                LOG.warning("keepalive timeout, dropping control connection")
+                self._fail()
+                return
+            self.send_frame(Frame(F_PING, 0), high=True)
+            LOG.debug("sending PING")
 
     # -- frame dispatch -----------------------------------------------------
 
@@ -759,6 +758,7 @@ class Tunnel:
 # Handshake
 # ---------------------------------------------------------------------------
 
+
 async def client_handshake(tunnel: Tunnel, token: str) -> None:
     """Perform the client side of the HELLO exchange."""
     token_bytes = token.encode("utf-8")
@@ -770,7 +770,7 @@ async def client_handshake(tunnel: Tunnel, token: str) -> None:
         frame = await asyncio.wait_for(
             read_frame(tunnel.reader, tunnel.max_frame_size), HANDSHAKE_TIMEOUT
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HandshakeError("timeout waiting for HELLO_OK")
 
     if frame.stream_id != 0:
@@ -789,7 +789,7 @@ async def server_handshake(tunnel: Tunnel, token: str) -> None:
         frame = await asyncio.wait_for(
             read_frame(tunnel.reader, tunnel.max_frame_size), HANDSHAKE_TIMEOUT
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HandshakeError("timeout waiting for HELLO")
 
     if frame.type != F_HELLO or frame.stream_id != 0:
@@ -809,7 +809,7 @@ async def server_handshake(tunnel: Tunnel, token: str) -> None:
         raise HandshakeError(f"protocol version mismatch ({version})")
 
     try:
-        received = frame.payload[4:4 + token_len].decode("utf-8")
+        received = frame.payload[4 : 4 + token_len].decode("utf-8")
     except UnicodeDecodeError:
         received = ""
 
@@ -828,12 +828,13 @@ async def server_handshake(tunnel: Tunnel, token: str) -> None:
 # Client
 # ---------------------------------------------------------------------------
 
+
 def spawn_outgoing_stream(
     tunnel: Tunnel,
     args: argparse.Namespace,
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-    target: Tuple[str, int],
+    target: tuple[str, int],
 ) -> Stream:
     """Create an initiator-side stream and start it."""
     stream_id = tunnel.alloc_id()
@@ -864,10 +865,10 @@ class Client:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.allow = AllowPolicy(args.allow, args.allow_all)
-        self.streams: Dict[int, Stream] = {}
+        self.streams: dict[int, Stream] = {}
         self.next_id = 1
-        self.tunnel: Optional[Tunnel] = None
-        self.servers: List[asyncio.AbstractServer] = []
+        self.tunnel: Tunnel | None = None
+        self.servers: list[asyncio.AbstractServer] = []
 
     # -- listeners ----------------------------------------------------------
 
@@ -984,14 +985,15 @@ async def run_client(args: argparse.Namespace) -> int:
 # Server
 # ---------------------------------------------------------------------------
 
+
 class Server:
     """Server side: accepts control connections and serves local forwards."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.allow = AllowPolicy(args.allow, args.allow_all)
-        self.tunnel: Optional[Tunnel] = None
-        self.servers: List[asyncio.AbstractServer] = []
+        self.tunnel: Tunnel | None = None
+        self.servers: list[asyncio.AbstractServer] = []
 
     async def start_listeners(self) -> None:
         for spec in self.args.forward:
@@ -1083,6 +1085,7 @@ async def run_server(args: argparse.Namespace) -> int:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tunnel.py",
@@ -1106,9 +1109,7 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="HOST:PORT",
             help="allow a specific target (repeatable)",
         )
-        sp.add_argument(
-            "--allow-all", action="store_true", help="allow any target"
-        )
+        sp.add_argument("--allow-all", action="store_true", help="allow any target")
         sp.add_argument(
             "--window-size",
             type=int,
@@ -1187,9 +1188,8 @@ def main() -> int:
     if args.keepalive < 0:
         parser.error("--keepalive must not be negative")
 
-    if args.mode == "client":
-        if args.keep_streams and args.reconnect is None:
-            parser.error("--keep-streams requires --reconnect")
+    if args.mode == "client" and args.keep_streams and args.reconnect is None:
+        parser.error("--keep-streams requires --reconnect")
 
     # Parse configuration strings early so that errors surface immediately.
     try:
