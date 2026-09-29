@@ -146,7 +146,7 @@ sequenceDiagram
     S-->>C: OPEN_OK (or OPEN_ERR)
     C->>S: DATA / WINDOW_UPDATE / FIN / CLOSE
     S-->>C: DATA / WINDOW_UPDATE / FIN / CLOSE
-    Note over C,S: Sends PING periodically; expects PONG
+    Note over C,S: Sends PING periodically#semi; expects PONG
 ```
 
 Key protocol details:
