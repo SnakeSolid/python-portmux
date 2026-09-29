@@ -333,6 +333,12 @@ class Stream:
         tunnel = self.tunnel
         if tunnel is None or self.target is None:
             return
+        LOG.debug(
+            "stream %d: sending OPEN for %s:%d",
+            self.id,
+            self.target[0],
+            self.target[1],
+        )
         tunnel.send_frame(
             Frame(F_OPEN, self.id, encode_open(self.target[0], self.target[1])),
             high=True,
@@ -398,6 +404,7 @@ class Stream:
             if tunnel is None:
                 return
             tunnel.send_frame(Frame(F_DATA, self.id, chunk), high=False)
+            LOG.debug("stream %d: sent %d bytes of DATA", self.id, len(chunk))
 
     async def _wait_credit(self) -> None:
         while self.send_credit <= 0 and not self.closed:
@@ -482,6 +489,7 @@ class Stream:
     def on_data(self, payload: bytes) -> None:
         if self.closed:
             return
+        LOG.debug("stream %d: received %d bytes of DATA", self.id, len(payload))
         self.incoming.put_nowait(payload)
 
     def on_window_update(self, credit: int) -> None:
@@ -652,6 +660,7 @@ class Tunnel:
                     self._fail()
                     return
                 self.send_frame(Frame(F_PING, 0), high=True)
+                LOG.debug("sending PING")
         except asyncio.CancelledError:
             raise
 
@@ -698,9 +707,11 @@ class Tunnel:
 
     def _handle_control(self, frame: Frame) -> None:
         if frame.type == F_PING:
+            LOG.debug("received PING, replying PONG")
             self.send_frame(Frame(F_PONG, 0), high=True)
         elif frame.type == F_PONG:
             self.last_pong = time.monotonic()
+            LOG.debug("received PONG")
         else:
             raise ProtocolError(
                 f"unexpected control frame 0x{frame.type:02x} after handshake"
@@ -838,6 +849,12 @@ def spawn_outgoing_stream(
     tunnel.streams[stream_id] = stream
     stream.attach(tunnel)
     stream.start()
+    LOG.debug(
+        "spawned incoming local connection as stream %d -> %s:%d",
+        stream_id,
+        target[0],
+        target[1],
+    )
     return stream
 
 
