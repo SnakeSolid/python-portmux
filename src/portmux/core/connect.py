@@ -13,15 +13,18 @@ from portmux.protocol.constants import (
     OPEN_ERR_TIMEOUT,
 )
 from portmux.protocol.errors import OpenFailure
+from portmux.util.socket import set_tcp_nodelay
 
 
 async def connect_target(host: str, port: int):
     """Open a TCP connection to the target, IPv4 only."""
     try:
-        return await asyncio.wait_for(
+        reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, family=socket.AF_INET),
             timeout=CONNECT_TIMEOUT,
         )
+        set_tcp_nodelay(writer)
+        return reader, writer
     except TimeoutError:
         raise OpenFailure(OPEN_ERR_TIMEOUT)
     except socket.gaierror:

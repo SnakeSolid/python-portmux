@@ -13,6 +13,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from portmux.core.stream import Stream
+from portmux.util.socket import set_tcp_nodelay
 
 if TYPE_CHECKING:
     from portmux.core.tunnel import Tunnel
@@ -59,6 +60,7 @@ async def on_local_connection(
     target_port: int,
 ) -> None:
     """Handle a locally accepted connection by spawning an initiator stream."""
+    set_tcp_nodelay(writer)
     if tunnel is None:
         LOG.warning("no active control connection, rejecting local connection")
         writer.close()

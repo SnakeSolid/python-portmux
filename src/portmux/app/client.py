@@ -12,6 +12,7 @@ from portmux.app.handshake import client_handshake
 from portmux.core.stream import Stream
 from portmux.core.tunnel import Tunnel
 from portmux.util.parse import AllowPolicy, parse_forward, parse_host_port
+from portmux.util.socket import set_tcp_nodelay
 
 LOG = logging.getLogger("tunnel")
 
@@ -65,6 +66,7 @@ class Client:
         host, port = parse_host_port(self.args.connect)
         try:
             reader, writer = await asyncio.open_connection(host, port)
+            set_tcp_nodelay(writer)
         except OSError as exc:
             LOG.error("cannot connect to %s:%d: %s", host, port, exc)
             return 1

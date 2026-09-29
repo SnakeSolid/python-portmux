@@ -11,6 +11,7 @@ from portmux.app.dispatcher import on_local_connection
 from portmux.app.handshake import server_handshake
 from portmux.core.tunnel import Tunnel
 from portmux.util.parse import AllowPolicy, parse_forward, parse_host_port
+from portmux.util.socket import set_tcp_nodelay
 
 LOG = logging.getLogger("tunnel")
 
@@ -58,6 +59,7 @@ class Server:
     ) -> None:
         peer = writer.get_extra_info("peername")
         LOG.info("incoming control connection from %s", peer)
+        set_tcp_nodelay(writer)
 
         tunnel = Tunnel(
             reader,
