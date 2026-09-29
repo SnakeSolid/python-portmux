@@ -169,7 +169,9 @@ Key protocol details:
 - Control frames are prioritized over `DATA` on the wire.
 
 Only **TCP** is supported (no UDP), and only **domain names and IPv4** addresses
-are allowed (no IPv6, no `[brackets]`).
+are allowed (no IPv6, no `[brackets]`). Target connections are opened with
+`socket.AF_INET`, and TCP_NODELAY is enabled on every socket (control, target,
+and local listeners).
 
 ## Behavior on control-connection break
 
@@ -183,8 +185,20 @@ are allowed (no IPv6, no `[brackets]`).
 ## Development
 
 The full framing and protocol specification used to implement this tool lives in
-[`arhitecture.md`](./arhitecture.md). Protocol version is **1** (compared for
-equality; no feature negotiation).
+[`docs/arhitecture.md`](docs/arhitecture.md). Protocol version is **1** (compared
+for equality; no feature negotiation).
+
+The runtime is split into focused subpackages under `src/portmux/`:
+
+| Package | Responsibility |
+|---------|----------------|
+| `portmux.protocol` | Wire format: frame serialization, payload helpers, constants, errors. |
+| `portmux.util` | Parsing, allow policy, CLI argument building, logging, socket helpers. |
+| `portmux.core` | The control connection (`Tunnel`), `Stream`, `PriorityWriter`, target connector. |
+| `portmux.app` | Client/server roles, handshake, the dispatcher, and the CLI entry point. |
+
+Although `pyproject.toml` declares an `asyncio` dependency, the runtime uses only
+the Python standard library; pure-stdlib packaging could drop that dependency.
 
 Run the test/validation suite with:
 
