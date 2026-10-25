@@ -1,7 +1,7 @@
 [project]
 name = "portmux"
 version = "0.1.0"
-description = "Add your description here"
+description = "A TCP port forwarding tunnel that multiplexes many logical streams over a single control connection using a strictly binary protocol."
 readme = "README.md"
 authors = [
     { name = "Shabanov Anton", email = "iamshabanov@yandex.ru" }
